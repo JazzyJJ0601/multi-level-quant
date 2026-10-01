@@ -56,6 +56,10 @@ quantized_tensors = multi_level_quantize(tensors, bit_widths)
 pytest
 ```
 
+**Measured status:** Baselines only so far on Qwen3-8B (FP16 49.4, 8-bit 62.1, uniform 4-bit collapses). The multi-level method itself has not been run on the real model yet.
+
+See [RESULTS.md](RESULTS.md)
+
 ## License
 
 MIT

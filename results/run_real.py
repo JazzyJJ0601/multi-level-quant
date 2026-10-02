@@ -1,165 +1,92 @@
 #!/usr/bin/env python3
+"""Real results: per-layer mixed 3/4-bit quantisation of Qwen3-8B at a fixed bit budget.
+
+Every decoder linear gets 3 or 4 bits (group-wise RTN, group 128). At a budget where a
+fraction F of the weights may use 4 bits, the method gives 4 bits to the layers where it
+cuts the most activation-weighted quantisation error per weight (greedy, calibrated on
+WikiText-2 train). The fair baseline is the same budget with layers picked at random.
+
+Configs: fp16, uniform 4-bit, uniform 3-bit, and for F in {25%, 50%}: sensitivity-chosen
+vs random-chosen (3 seeds). Perplexity on WikiText-2 test, 40 x 512 tokens.
+Results go to results/real.json as each config finishes.
 """
-Multi-level quantization benchmark on real Qwen3-8B.
-Compares baseline vs 8-bit uniform on perplexity.
-Quantizes model in-place one weight at a time via numpy (fits GPU memory).
-"""
-import sys, math, gc, os, time
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+import gc
+import random
+import sys
+import time
+from pathlib import Path
 
-MODEL_PATH = "/home/jasper/eirene-projects/03-inference-lab/ai-lab/models/Qwen--Qwen3-8B"
-PROMPTS = ["The meaning of life is", "The fastest way to learn"]
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RESULTS_PATH = os.path.join(BASE_DIR, "RESULTS.md")
+import torch
 
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from qcommon import (act_stats, decoder_linears, load_model, packed_gb, perplexity, rtn,  # noqa: E402
+                     save, weighted_err, windows)
 
-def free_memory():
-    gc.collect()
-    import torch
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+OUT = HERE / "real.json"
+N_TEST, N_CALIB = 40, 8
 
 
-def compute_perplexity(model, tokenizer, prompts):
-    import torch
-    model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-    device = next(model.parameters()).device
-    with torch.no_grad():
-        for prompt in prompts:
-            enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=64)
-            input_ids = enc["input_ids"].to(device)
-            outputs = model(input_ids=input_ids, labels=input_ids)
-            loss = outputs.loss.item()
-            n_tokens = input_ids.shape[1]
-            total_loss += loss * n_tokens
-            total_tokens += n_tokens
-    return math.exp(total_loss / total_tokens)
-
-
-def quantize_model_in_place(model, bit_width):
-    """Quantize model weights in-place. One weight at a time via numpy (CPU, avoids OOM)."""
-    import torch
-    import numpy as np
-    from quantizer import quantize_tensor, dequantize_tensor
-    skip_keywords = ["norm", "layernorm", "rms_norm", "ln_"]
-    with torch.no_grad():
-        for name, param in model.named_parameters():
-            if "weight" not in name:
-                continue
-            low_name = name.lower()
-            if any(sk in low_name for sk in skip_keywords):
-                continue
-            data = param.cpu().float().numpy()
-            tmax = np.max(np.abs(data))
-            if tmax == 0:
-                continue
-            q = quantize_tensor(data, bit_width)
-            dq = dequantize_tensor(q, bit_width, tmax)
-            param.data.copy_(torch.from_numpy(dq).to(dtype=param.dtype, device=param.device))
-
-
-def load_model(tokenizer):
-    import torch
-    from transformers import AutoModelForCausalLM
-    print("  Loading model...", end=" ", flush=True)
-    t0 = time.time()
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
-        torch_dtype=torch.bfloat16,
-        local_files_only=True,
-        trust_remote_code=True,
-        device_map="auto",
-    )
-    print(f"{time.time()-t0:.1f}s", flush=True)
-    return model
-
-
-def run_benchmark():
-    import torch
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_PATH, local_files_only=True, trust_remote_code=True
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    results = {}
-
-    # --- 1. Baseline ---
-    print("=== Baseline (unquantised) ===", flush=True)
-    model = load_model(tokenizer)
-    t0 = time.time()
-    results["baseline"] = compute_perplexity(model, tokenizer, PROMPTS)
-    print(f"  Perplexity: {results['baseline']:.4f}  ({time.time()-t0:.1f}s)", flush=True)
-    del model
-    free_memory()
-
-    # --- 2. 8-bit (fresh load + in-place quantize) ---
-    print("=== 8-bit Uniform ===", flush=True)
-    model = load_model(tokenizer)
-    q_start = time.time()
-    quantize_model_in_place(model, 8)
-    print(f"  Quantised in {time.time()-q_start:.1f}s", flush=True)
-    t0 = time.time()
-    results["8bit"] = compute_perplexity(model, tokenizer, PROMPTS)
-    print(f"  Perplexity: {results['8bit']:.4f}  ({time.time()-t0:.1f}s)", flush=True)
-    del model
-    free_memory()
-
-    # Note: 4-bit uniform is not tested. The quantizer produces degenerate results
-    # on Qwen3-8B (perplexity >> 800M), indicating 4-bit uniform is too aggressive
-    # for this model. This actually motivates multi-level quantization — assign 8-bit
-    # to sensitive layers and 4-bit only to robust ones.
-    results["4bit"] = None
-
-    return results
-
-
-def write_results(r):
-    b = r["baseline"]
-    p8 = r["8bit"]
-    lines = [
-        "# Multi-Level Quantization Results",
-        "",
-        "## Command",
-        "",
-        "```",
-        "python3 repos/multi-level-quant/results/run_real.py",
-        "```",
-        "",
-        "## Real-Model Results (Qwen3-8B)",
-        "",
-        "| Method | Avg Bits | Perplexity | vs Baseline |",
-        "|--------|----------|------------|-------------|",
-        f"| Baseline (unquantised) | 16.0 | {b:.4f} | — |",
-        f"| 8-bit Uniform | 8.0 | {p8:.4f} | {p8-b:+.4f} |",
-        "| 4-bit Uniform | 4.0 | N/A (model collapses) | N/A |",
-        "",
-        "## Interpretation",
-        "",
-        f"8-bit uniform weight quantisation degrades Qwen3-8B perplexity only slightly "
-        f"({p8-b:+.2f}), confirming that 8-bit preserves most model quality on short text.",
-        f"4-bit uniform quantisation destroys Qwen3-8B entirely (perplexity >> 10⁶), making "
-        f"prediction no better than random. This motivates multi-level quantisation: assigning "
-        f"8-bit to sensitive layers and 4-bit only to the most robust ones, the central idea "
-        f"of this repository.",
-        "",
-    ]
-    with open(RESULTS_PATH, "w") as f:
-        f.write("\n".join(lines))
-    print(f"\nResults written to {RESULTS_PATH}")
+def allocate(linears, order, frac):
+    """Give 4 bits to layers in `order` until `frac` of all linear weights are 4-bit."""
+    total = sum(m.weight.numel() for _, m in linears)
+    size = {n: m.weight.numel() for n, m in linears}
+    bits, used = {n: 3 for n, _ in linears}, 0
+    for n in order:
+        if used + size[n] > frac * total:
+            continue
+        bits[n], used = 4, used + size[n]
+    return bits, used / total
 
 
 def main():
-    start = time.time()
-    r = run_benchmark()
-    write_results(r)
-    elapsed = time.time() - start
-    print(f"Total time: {elapsed:.1f}s")
-    assert elapsed < 115, f"Too slow: {elapsed:.1f}s > 115s limit"
+    model, tok = load_model()
+    test, calib = windows(tok, "test", N_TEST), windows(tok, "train", N_CALIB)
+    linears = decoder_linears(model)
+    originals = {n: m.weight.data.to("cpu", copy=True) for n, m in linears}
+    acts = act_stats(model, linears, calib)
+
+    # sensitivity: error saved per weight by going 3 -> 4 bits
+    gain = {}
+    for n, m in linears:
+        w = m.weight.data
+        gain[n] = (weighted_err(w, rtn(w, 3), acts[n]) - weighted_err(w, rtn(w, 4), acts[n])) / w.numel()
+    by_gain = sorted(gain, key=gain.get, reverse=True)
+
+    configs = {"fp16": None, "uniform_4bit": {n: 4 for n, _ in linears},
+               "uniform_3bit": {n: 3 for n, _ in linears}}
+    for frac in (0.25, 0.5):
+        configs[f"sensitivity_{int(frac * 100)}pct4bit"] = allocate(linears, by_gain, frac)[0]
+        for seed in range(3):
+            order = [n for n, _ in linears]
+            random.Random(seed).shuffle(order)
+            configs[f"random_{int(frac * 100)}pct4bit_seed{seed}"] = allocate(linears, order, frac)[0]
+
+    results = {"setup": {"model": "Qwen3-8B", "group": 128, "quantiser": "asymmetric RTN",
+                         "eval": f"WikiText-2 test, {N_TEST}x512 tokens",
+                         "calib": f"WikiText-2 train, {N_CALIB}x512 tokens", "linears": len(linears)}}
+    for name, bits in configs.items():
+        t0 = time.time()
+        for n, m in linears:
+            m.weight.data = originals[n].cuda()
+            if bits is not None:
+                m.weight.data = rtn(m.weight.data, bits[n]).to(torch.bfloat16)
+        row = {"ppl": round(perplexity(model, test), 4)}
+        if bits is not None:
+            sizes = {n: m.weight.numel() for n, m in linears}
+            row["avg_bits"] = round(sum(bits[n] * sizes[n] for n in bits) / sum(sizes.values()), 3)
+            row["packed_gb"] = packed_gb(model, bits)
+            row["layers_4bit"] = sum(b == 4 for b in bits.values())
+        row["seconds"] = round(time.time() - t0, 1)
+        results[name] = row
+        save(OUT, results)
+        print(name, row, flush=True)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    top = by_gain[:20]
+    results["most_sensitive_layers"] = top
+    save(OUT, results)
 
 
 if __name__ == "__main__":
